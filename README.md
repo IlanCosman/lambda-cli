@@ -103,6 +103,11 @@ lambda list
 lambda start --gpu gpu_1x_a10 --ssh my-key --name "dev-box"
 ```
 
+**Start an instance with Ubuntu 22.04 (explicit override):**
+```bash
+lambda start --gpu gpu_1x_a10 --ssh my-key --stack ubuntu-os-22-04-lts-nvidia-535
+```
+
 **Stop an instance:**
 ```bash
 lambda stop --instance-id <id>
@@ -123,6 +128,7 @@ lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 | `-n, --name` | Instance name |
 | `-r, --region` | Region (auto-selects if omitted) |
 | `-f, --filesystem` | Filesystem to attach (must be in same region) |
+| `--stack` | OS stack/image to use (default: Ubuntu 24.04) |
 | `--no-notify` | Disable notifications even if env vars are set |
 
 #### find
@@ -133,6 +139,7 @@ lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 | `--interval` | Poll interval in seconds (default: 10) |
 | `-n, --name` | Instance name when launched |
 | `-f, --filesystem` | Filesystem to attach when launched |
+| `--stack` | OS stack/image to use (default: Ubuntu 24.04) |
 | `--no-notify` | Disable notifications even if env vars are set |
 
 Notifications are **automatic** when env vars are configured. Use `--no-notify` to disable:

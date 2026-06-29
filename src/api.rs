@@ -10,6 +10,9 @@ use thiserror::Error;
 pub const API_BASE_URL: &str = "https://cloud.lambdalabs.com/api/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// Default OS stack/image used when launching instances (Ubuntu 24.04 LTS).
+pub const DEFAULT_STACK: &str = "ubuntu-os-24-04-lts-nvidia-570";
+
 #[derive(Error, Debug)]
 pub enum LambdaError {
     #[error("API key not set. Set LAMBDA_API_KEY or LAMBDA_API_KEY_COMMAND environment variable")]
@@ -336,11 +339,14 @@ impl LambdaClient {
         name: Option<&str>,
         region: Option<&str>,
     ) -> Result<LaunchResult> {
-        self.launch_instance_with_filesystem(gpu, ssh_key, name, region, None)
+        self.launch_instance_with_filesystem(gpu, ssh_key, name, region, None, None)
             .await
     }
 
-    /// Launch a new instance with optional filesystem attachment
+    /// Launch a new instance with optional filesystem attachment and optional stack/image selector.
+    ///
+    /// `stack` selects the OS image (e.g. `"ubuntu-os-24-04-lts-nvidia-570"`).
+    /// When `None`, [`DEFAULT_STACK`] (Ubuntu 24.04) is used.
     pub async fn launch_instance_with_filesystem(
         &self,
         gpu: &str,
@@ -348,6 +354,7 @@ impl LambdaClient {
         name: Option<&str>,
         region: Option<&str>,
         filesystem: Option<&str>,
+        stack: Option<&str>,
     ) -> Result<LaunchResult> {
         let instance_type_response = self
             .get_instance_type(gpu)
@@ -390,7 +397,8 @@ impl LambdaClient {
             "region_name": region_name,
             "instance_type_name": gpu,
             "ssh_key_names": [ssh_key],
-            "quantity": 1
+            "quantity": 1,
+            "image_id": stack.unwrap_or(DEFAULT_STACK)
         });
 
         if let Some(instance_name) = name {
@@ -677,5 +685,39 @@ mod tests {
     #[test]
     fn test_api_base_url() {
         assert_eq!(API_BASE_URL, "https://cloud.lambdalabs.com/api/v1");
+    }
+
+    #[test]
+    fn test_default_stack_is_24_04() {
+        assert!(
+            DEFAULT_STACK.contains("24-04"),
+            "DEFAULT_STACK should reference Ubuntu 24.04, got: {}",
+            DEFAULT_STACK
+        );
+    }
+
+    #[test]
+    fn test_launch_payload_uses_default_stack() {
+        let image_id = serde_json::json!({
+            "region_name": "us-east-1",
+            "instance_type_name": "gpu_1x_a10",
+            "ssh_key_names": ["my-key"],
+            "quantity": 1,
+            "image_id": DEFAULT_STACK
+        });
+        assert_eq!(image_id["image_id"], DEFAULT_STACK);
+    }
+
+    #[test]
+    fn test_launch_payload_uses_custom_stack() {
+        let custom_stack = "ubuntu-os-22-04-lts-nvidia-535";
+        let payload = serde_json::json!({
+            "region_name": "us-east-1",
+            "instance_type_name": "gpu_1x_a10",
+            "ssh_key_names": ["my-key"],
+            "quantity": 1,
+            "image_id": custom_stack
+        });
+        assert_eq!(payload["image_id"], custom_stack);
     }
 }

@@ -137,6 +137,8 @@ struct StartInstanceParams {
     region: Option<String>,
     /// Optional filesystem name to attach (must be in the same region)
     filesystem: Option<String>,
+    /// Optional OS stack/image selector (e.g., "ubuntu-os-24-04-lts-nvidia-570"). Defaults to Ubuntu 24.04 when omitted.
+    stack: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -183,7 +185,7 @@ impl LambdaService {
     }
 
     #[tool(
-        description = "Launch a new GPU instance. Returns instance ID and connection details. Optionally attach a filesystem (must be in the same region). If notification env vars are configured, will auto-notify when instance is SSH-able."
+        description = "Launch a new GPU instance. Returns instance ID and connection details. Optionally attach a filesystem (must be in the same region). Optionally specify an OS stack/image via the 'stack' field (defaults to Ubuntu 24.04). If notification env vars are configured, will auto-notify when instance is SSH-able."
     )]
     async fn start_instance(
         &self,
@@ -197,6 +199,7 @@ impl LambdaService {
                 params.name.as_deref(),
                 params.region.as_deref(),
                 params.filesystem.as_deref(),
+                params.stack.as_deref(),
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;

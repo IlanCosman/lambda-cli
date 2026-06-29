@@ -45,6 +45,9 @@ enum Commands {
         /// Filesystem name to attach (must be in same region)
         #[arg(short, long)]
         filesystem: Option<String>,
+        /// OS stack/image to use (defaults to Ubuntu 24.04)
+        #[arg(long)]
+        stack: Option<String>,
         /// Disable notifications even if LAMBDA_NOTIFY_* env vars are set
         #[arg(long)]
         no_notify: bool,
@@ -74,6 +77,9 @@ enum Commands {
         /// Filesystem name to attach when launched (must be in same region)
         #[arg(short, long)]
         filesystem: Option<String>,
+        /// OS stack/image to use (defaults to Ubuntu 24.04)
+        #[arg(long)]
+        stack: Option<String>,
         /// Disable notifications even if LAMBDA_NOTIFY_* env vars are set
         #[arg(long)]
         no_notify: bool,
@@ -119,6 +125,7 @@ fn run() -> Result<()> {
             name,
             region,
             filesystem,
+            stack,
             no_notify,
         }) => start_instance(
             &rt,
@@ -128,6 +135,7 @@ fn run() -> Result<()> {
             name.as_deref(),
             region.as_deref(),
             filesystem.as_deref(),
+            stack.as_deref(),
             *no_notify,
         ),
         Some(Commands::Stop { instance_id }) => stop_instance(&rt, &client, instance_id),
@@ -138,6 +146,7 @@ fn run() -> Result<()> {
             interval,
             name,
             filesystem,
+            stack,
             no_notify,
         }) => find_and_start_instance(
             &rt,
@@ -147,6 +156,7 @@ fn run() -> Result<()> {
             *interval,
             name.as_deref(),
             filesystem.as_deref(),
+            stack.as_deref(),
             *no_notify,
         ),
         Some(Commands::Filesystems) => list_filesystems(&rt, &client),
@@ -217,6 +227,7 @@ fn start_instance(
     name: Option<&str>,
     region: Option<&str>,
     filesystem: Option<&str>,
+    stack: Option<&str>,
     no_notify: bool,
 ) -> Result<()> {
     // Auto-enable notifications if env vars are configured (unless --no-notify)
@@ -245,7 +256,7 @@ fn start_instance(
     );
 
     let result =
-        rt.block_on(client.launch_instance_with_filesystem(gpu, ssh, name, region, filesystem))?;
+        rt.block_on(client.launch_instance_with_filesystem(gpu, ssh, name, region, filesystem, stack))?;
 
     println!(
         "{} Instance {} launched in region {}",
@@ -407,6 +418,7 @@ fn find_and_start_instance(
     interval: u64,
     name: Option<&str>,
     filesystem: Option<&str>,
+    stack: Option<&str>,
     no_notify: bool,
 ) -> Result<()> {
     if ssh.is_empty() {
@@ -440,7 +452,7 @@ fn find_and_start_instance(
                     regions.join(", ").blue()
                 );
 
-                return start_instance(rt, client, gpu, ssh, name, None, filesystem, no_notify);
+                return start_instance(rt, client, gpu, ssh, name, None, filesystem, stack, no_notify);
             }
             Ok(_) => {
                 // No availability
