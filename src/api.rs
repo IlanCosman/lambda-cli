@@ -10,6 +10,23 @@ use thiserror::Error;
 pub const API_BASE_URL: &str = "https://cloud.lambdalabs.com/api/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// The machine image family used when launching an instance without an explicit
+/// image. Lambda's own default (sending no image) is the latest Lambda Stack on
+/// Ubuntu 22.04; we pin to the Ubuntu 24.04 Lambda Stack instead.
+pub const DEFAULT_IMAGE_FAMILY: &str = "lambda-stack-24-04";
+
+/// Resolve an optional image argument to the family that will actually be used.
+///
+/// Blank or whitespace-only input is treated as "not specified" so it falls back
+/// to [`DEFAULT_IMAGE_FAMILY`] (rather than sending an invalid empty family);
+/// surrounding whitespace on a real value is trimmed.
+pub fn resolve_image_family(image: Option<&str>) -> &str {
+    image
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_IMAGE_FAMILY)
+}
+
 #[derive(Error, Debug)]
 pub enum LambdaError {
     #[error("API key not set. Set LAMBDA_API_KEY or LAMBDA_API_KEY_COMMAND environment variable")]
@@ -124,6 +141,71 @@ pub struct Region {
     pub name: String,
     #[allow(dead_code)]
     pub description: String,
+}
+
+/// A machine image available in Lambda Cloud (returned by the images endpoint)
+#[derive(Deserialize, Debug, Clone, Serialize)]
+pub struct Image {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub family: String,
+    pub version: String,
+    pub architecture: String,
+    pub region: ImageRegion,
+}
+
+#[derive(Deserialize, Debug, Clone, Serialize)]
+pub struct ImageRegion {
+    pub name: String,
+    pub description: String,
+}
+
+/// A summary of a single image family, aggregated across regions and versions.
+/// The `family` is the value users pass to select an image at launch.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageFamilySummary {
+    pub family: String,
+    pub description: String,
+    pub architectures: Vec<String>,
+    pub regions: Vec<String>,
+}
+
+/// Collapse the raw image list into one entry per family, with the set of
+/// architectures and regions each family is available in. Sorted by family name.
+pub fn summarize_image_families(images: &[Image]) -> Vec<ImageFamilySummary> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct Acc {
+        description: String,
+        architectures: BTreeSet<String>,
+        regions: BTreeSet<String>,
+    }
+
+    let mut families: BTreeMap<String, Acc> = BTreeMap::new();
+    for image in images {
+        let acc = families.entry(image.family.clone()).or_insert_with(|| Acc {
+            description: image.description.clone(),
+            architectures: BTreeSet::new(),
+            regions: BTreeSet::new(),
+        });
+        // Prefer the shortest description within a family (avoids version-suffixed variants).
+        if image.description.len() < acc.description.len() {
+            acc.description = image.description.clone();
+        }
+        acc.architectures.insert(image.architecture.clone());
+        acc.regions.insert(image.region.name.clone());
+    }
+
+    families
+        .into_iter()
+        .map(|(family, acc)| ImageFamilySummary {
+            family,
+            description: acc.description,
+            architectures: acc.architectures.into_iter().collect(),
+            regions: acc.regions.into_iter().collect(),
+        })
+        .collect()
 }
 
 /// Source for the API key - either a direct value or a command to execute
@@ -303,6 +385,31 @@ impl LambdaClient {
         Ok(result)
     }
 
+    /// List all available machine images
+    pub async fn list_images(&self) -> Result<Vec<Image>> {
+        let api_key = self.get_api_key()?;
+        let url = format!("{}/images", API_BASE_URL);
+        let response = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", api_key))
+            .send()
+            .await
+            .context("Failed to fetch images")?;
+
+        if !response.status().is_success() {
+            let error_msg = Self::parse_error_response(response).await;
+            return Err(anyhow!("Failed to list images: {}", error_msg));
+        }
+
+        let response: ApiResponse<Vec<Image>> = response
+            .json()
+            .await
+            .context("Failed to parse images response")?;
+
+        Ok(response.data)
+    }
+
     /// Get instance type details (for checking availability)
     pub async fn get_instance_type(&self, gpu: &str) -> Result<Option<InstanceTypeResponse>> {
         let api_key = self.get_api_key()?;
@@ -336,11 +443,15 @@ impl LambdaClient {
         name: Option<&str>,
         region: Option<&str>,
     ) -> Result<LaunchResult> {
-        self.launch_instance_with_filesystem(gpu, ssh_key, name, region, None)
+        self.launch_instance_with_filesystem(gpu, ssh_key, name, region, None, None)
             .await
     }
 
-    /// Launch a new instance with optional filesystem attachment
+    /// Launch a new instance with optional filesystem attachment and image family.
+    ///
+    /// When `image` is `None`, the instance is launched with
+    /// [`DEFAULT_IMAGE_FAMILY`]. Pass an image family (e.g. `ubuntu-24-04`) to
+    /// override it.
     pub async fn launch_instance_with_filesystem(
         &self,
         gpu: &str,
@@ -348,6 +459,7 @@ impl LambdaClient {
         name: Option<&str>,
         region: Option<&str>,
         filesystem: Option<&str>,
+        image: Option<&str>,
     ) -> Result<LaunchResult> {
         let instance_type_response = self
             .get_instance_type(gpu)
@@ -386,11 +498,13 @@ impl LambdaClient {
 
         let url = format!("{}/instance-operations/launch", API_BASE_URL);
 
+        let image_family = resolve_image_family(image);
         let mut payload = serde_json::json!({
             "region_name": region_name,
             "instance_type_name": gpu,
             "ssh_key_names": [ssh_key],
-            "quantity": 1
+            "quantity": 1,
+            "image": { "family": image_family }
         });
 
         if let Some(instance_name) = name {
@@ -677,5 +791,85 @@ mod tests {
     #[test]
     fn test_api_base_url() {
         assert_eq!(API_BASE_URL, "https://cloud.lambdalabs.com/api/v1");
+    }
+
+    #[test]
+    fn test_default_image_family() {
+        assert_eq!(DEFAULT_IMAGE_FAMILY, "lambda-stack-24-04");
+    }
+
+    #[test]
+    fn test_resolve_image_family() {
+        // Unspecified or blank input falls back to the default.
+        assert_eq!(resolve_image_family(None), DEFAULT_IMAGE_FAMILY);
+        assert_eq!(resolve_image_family(Some("")), DEFAULT_IMAGE_FAMILY);
+        assert_eq!(resolve_image_family(Some("   ")), DEFAULT_IMAGE_FAMILY);
+        // A real value is used as-is, with surrounding whitespace trimmed.
+        assert_eq!(resolve_image_family(Some("ubuntu-24-04")), "ubuntu-24-04");
+        assert_eq!(
+            resolve_image_family(Some("  ubuntu-24-04 ")),
+            "ubuntu-24-04"
+        );
+    }
+
+    fn test_image(family: &str, description: &str, architecture: &str, region: &str) -> Image {
+        Image {
+            id: "id".to_string(),
+            name: "name".to_string(),
+            description: description.to_string(),
+            family: family.to_string(),
+            version: "1.0".to_string(),
+            architecture: architecture.to_string(),
+            region: ImageRegion {
+                name: region.to_string(),
+                description: "desc".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_summarize_image_families() {
+        let images = vec![
+            test_image("ubuntu-24-04", "Ubuntu 24.04 LTS", "x86_64", "us-east-1"),
+            test_image("ubuntu-24-04", "Ubuntu 24.04 LTS", "x86_64", "us-west-1"),
+            test_image("ubuntu-24-04", "Ubuntu 24.04 LTS", "arm64", "us-east-3"),
+            test_image("lambda-stack-24-04", "Lambda Stack", "x86_64", "us-east-1"),
+        ];
+
+        let summaries = summarize_image_families(&images);
+
+        // Sorted by family name.
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].family, "lambda-stack-24-04");
+        assert_eq!(summaries[1].family, "ubuntu-24-04");
+
+        // Architectures and regions are deduplicated and sorted.
+        assert_eq!(summaries[1].architectures, vec!["arm64", "x86_64"]);
+        assert_eq!(
+            summaries[1].regions,
+            vec!["us-east-1", "us-east-3", "us-west-1"]
+        );
+    }
+
+    #[test]
+    fn test_summarize_prefers_shortest_description() {
+        let images = vec![
+            test_image(
+                "lambda-stack-22-04",
+                "AI ready GPU image 22.04.5",
+                "x86_64",
+                "us-east-1",
+            ),
+            test_image(
+                "lambda-stack-22-04",
+                "AI ready GPU image",
+                "x86_64",
+                "us-west-1",
+            ),
+        ];
+
+        let summaries = summarize_image_families(&images);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].description, "AI ready GPU image");
     }
 }

@@ -1,5 +1,8 @@
 use anyhow::Result;
-use lambda_cli::api::{Filesystem, Instance, InstanceTypeData, LambdaClient};
+use lambda_cli::api::{
+    resolve_image_family, summarize_image_families, Filesystem, ImageFamilySummary, Instance,
+    InstanceTypeData, LambdaClient, DEFAULT_IMAGE_FAMILY,
+};
 use lambda_cli::notify::{InstanceReadyMessage, Notifier, NotifyConfig};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -93,6 +96,31 @@ impl LambdaService {
         output
     }
 
+    fn format_image_families(families: &[ImageFamilySummary]) -> String {
+        if families.is_empty() {
+            return "No images available.".to_string();
+        }
+        let mut output = String::from(
+            "Available Machine Images (pass `family` as the `image` parameter to start_instance):\n\n",
+        );
+        for family in families {
+            let default_marker = if family.family == DEFAULT_IMAGE_FAMILY {
+                " (default)"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "• {}{}\n  {}\n  Architectures: {} | Available in {} regions\n\n",
+                family.family,
+                default_marker,
+                family.description,
+                family.architectures.join(", "),
+                family.regions.len()
+            ));
+        }
+        output
+    }
+
     fn format_filesystems(filesystems: &[Filesystem]) -> String {
         if filesystems.is_empty() {
             return "No filesystems.".to_string();
@@ -137,6 +165,9 @@ struct StartInstanceParams {
     region: Option<String>,
     /// Optional filesystem name to attach (must be in the same region)
     filesystem: Option<String>,
+    /// Optional machine image family (e.g. ubuntu-24-04, gpu-base-24-04). Use
+    /// the list_images tool to discover options. Defaults to lambda-stack-24-04.
+    image: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -183,7 +214,24 @@ impl LambdaService {
     }
 
     #[tool(
-        description = "Launch a new GPU instance. Returns instance ID and connection details. Optionally attach a filesystem (must be in the same region). If notification env vars are configured, will auto-notify when instance is SSH-able."
+        description = "List all available machine image families (e.g. lambda-stack-24-04, ubuntu-24-04). Use a family name as the 'image' parameter when launching an instance."
+    )]
+    async fn list_images(&self) -> Result<CallToolResult, McpError> {
+        let images = self
+            .client
+            .list_images()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let families = summarize_image_families(&images);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            Self::format_image_families(&families),
+        )]))
+    }
+
+    #[tool(
+        description = "Launch a new GPU instance. Returns instance ID and connection details. Optionally attach a filesystem (must be in the same region) or choose a machine image family (defaults to lambda-stack-24-04). If notification env vars are configured, will auto-notify when instance is SSH-able."
     )]
     async fn start_instance(
         &self,
@@ -197,10 +245,12 @@ impl LambdaService {
                 params.name.as_deref(),
                 params.region.as_deref(),
                 params.filesystem.as_deref(),
+                params.image.as_deref(),
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        let image_family = resolve_image_family(params.image.as_deref());
         let fs_info = params
             .filesystem
             .as_ref()
@@ -235,8 +285,8 @@ impl LambdaService {
         };
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Instance launched successfully!\n\nInstance ID: {}\nRegion: {}{}\n\nNote: Instance may take a few minutes to become active. Use 'list_running_instances' to check status.{}",
-            result.instance_id, result.region, fs_info, notify_status
+            "Instance launched successfully!\n\nInstance ID: {}\nRegion: {}\nImage: {}{}\n\nNote: Instance may take a few minutes to become active. Use 'list_running_instances' to check status.{}",
+            result.instance_id, result.region, image_family, fs_info, notify_status
         ))]))
     }
 

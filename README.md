@@ -86,6 +86,7 @@ export LAMBDA_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 | Command | Description |
 |---------|-------------|
 | `lambda list` | Show available GPU types with pricing and availability |
+| `lambda images` | Show available machine images (OS / Lambda Stack families) |
 | `lambda running` | Show your running instances |
 | `lambda start` | Launch a new instance |
 | `lambda stop` | Terminate an instance |
@@ -101,6 +102,14 @@ lambda list
 **Start an instance:**
 ```bash
 lambda start --gpu gpu_1x_a10 --ssh my-key --name "dev-box"
+```
+
+Instances launch with the **Lambda Stack 24.04** image by default (Ubuntu 24.04 + NVIDIA drivers, CUDA, and ML frameworks). Pass `--image` to choose a different one:
+
+```bash
+# List available images, then launch with a specific family
+lambda images
+lambda start --gpu gpu_1x_a10 --ssh my-key --image ubuntu-24-04
 ```
 
 **Stop an instance:**
@@ -123,6 +132,7 @@ lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 | `-n, --name` | Instance name |
 | `-r, --region` | Region (auto-selects if omitted) |
 | `-f, --filesystem` | Filesystem to attach (must be in same region) |
+| `--image` | Machine image family (default: `lambda-stack-24-04`; see `lambda images`) |
 | `--no-notify` | Disable notifications even if env vars are set |
 
 #### find
@@ -133,6 +143,7 @@ lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 | `--interval` | Poll interval in seconds (default: 10) |
 | `-n, --name` | Instance name when launched |
 | `-f, --filesystem` | Filesystem to attach when launched |
+| `--image` | Machine image family (default: `lambda-stack-24-04`; see `lambda images`) |
 | `--no-notify` | Disable notifications even if env vars are set |
 
 Notifications are **automatic** when env vars are configured. Use `--no-notify` to disable:
@@ -177,7 +188,8 @@ npx @strand-ai/lambda-mcp --eager
 | Tool | Description |
 |------|-------------|
 | `list_gpu_types` | List all available GPU instance types with pricing, specs, and current availability |
-| `start_instance` | Launch a new GPU instance (auto-notifies if configured) |
+| `list_images` | List available machine image families (use one as the `image` arg to `start_instance`) |
+| `start_instance` | Launch a new GPU instance (optional `image` family, defaults to `lambda-stack-24-04`; auto-notifies if configured) |
 | `stop_instance` | Terminate a running instance |
 | `list_running_instances` | Show all running instances with status and connection details |
 | `check_availability` | Check if a specific GPU type is available |

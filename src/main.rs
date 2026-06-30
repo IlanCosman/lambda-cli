@@ -7,9 +7,11 @@ use crossterm::{
     execute,
     terminal::{Clear, ClearType},
 };
-use lambda_cli::api::{LambdaClient, LambdaError};
+use lambda_cli::api::{
+    resolve_image_family, summarize_image_families, LambdaClient, LambdaError, DEFAULT_IMAGE_FAMILY,
+};
 use lambda_cli::notify::{InstanceReadyMessage, Notifier, NotifyConfig};
-use prettytable::{row, Table};
+use prettytable::{row, Cell, Row, Table};
 use std::io::{stdout, Write};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
@@ -45,6 +47,10 @@ enum Commands {
         /// Filesystem name to attach (must be in same region)
         #[arg(short, long)]
         filesystem: Option<String>,
+        /// Machine image family to launch (e.g. ubuntu-24-04, gpu-base-24-04).
+        /// Run `lambda images` to list options. Defaults to lambda-stack-24-04.
+        #[arg(long)]
+        image: Option<String>,
         /// Disable notifications even if LAMBDA_NOTIFY_* env vars are set
         #[arg(long)]
         no_notify: bool,
@@ -74,10 +80,16 @@ enum Commands {
         /// Filesystem name to attach when launched (must be in same region)
         #[arg(short, long)]
         filesystem: Option<String>,
+        /// Machine image family to launch (e.g. ubuntu-24-04, gpu-base-24-04).
+        /// Run `lambda images` to list options. Defaults to lambda-stack-24-04.
+        #[arg(long)]
+        image: Option<String>,
         /// Disable notifications even if LAMBDA_NOTIFY_* env vars are set
         #[arg(long)]
         no_notify: bool,
     },
+    /// List all available machine images
+    Images,
     /// List all filesystems (persistent storage)
     Filesystems,
     /// Create a new filesystem
@@ -119,6 +131,7 @@ fn run() -> Result<()> {
             name,
             region,
             filesystem,
+            image,
             no_notify,
         }) => start_instance(
             &rt,
@@ -128,6 +141,7 @@ fn run() -> Result<()> {
             name.as_deref(),
             region.as_deref(),
             filesystem.as_deref(),
+            image.as_deref(),
             *no_notify,
         ),
         Some(Commands::Stop { instance_id }) => stop_instance(&rt, &client, instance_id),
@@ -138,6 +152,7 @@ fn run() -> Result<()> {
             interval,
             name,
             filesystem,
+            image,
             no_notify,
         }) => find_and_start_instance(
             &rt,
@@ -147,8 +162,10 @@ fn run() -> Result<()> {
             *interval,
             name.as_deref(),
             filesystem.as_deref(),
+            image.as_deref(),
             *no_notify,
         ),
+        Some(Commands::Images) => list_images(&rt, &client),
         Some(Commands::Filesystems) => list_filesystems(&rt, &client),
         Some(Commands::CreateFilesystem { name, region }) => {
             create_filesystem(&rt, &client, name, region)
@@ -181,27 +198,28 @@ fn list_instances(rt: &Runtime, client: &LambdaClient) -> Result<()> {
     ]);
 
     for t in types {
-        let availability = if t.regions_available.is_empty() {
-            "None".red().to_string()
-        } else {
-            t.regions_available.join(", ").blue().to_string()
-        };
-
         let price = format!("${:.2}", t.price_cents_per_hour as f64 / 100.0);
 
-        table.add_row(row![
-            if t.regions_available.is_empty() {
-                t.name.dimmed().to_string()
-            } else {
-                t.name.green().to_string()
-            },
-            t.description,
-            price.yellow(),
-            t.vcpus,
-            t.memory_gib,
-            t.storage_gib,
-            availability
-        ]);
+        let name_cell = if t.regions_available.is_empty() {
+            Cell::new(&t.name)
+        } else {
+            Cell::new(&t.name).style_spec("Fg")
+        };
+        let availability_cell = if t.regions_available.is_empty() {
+            Cell::new("None").style_spec("Fr")
+        } else {
+            Cell::new(&t.regions_available.join(", ")).style_spec("Fb")
+        };
+
+        table.add_row(Row::new(vec![
+            name_cell,
+            Cell::new(&t.description),
+            Cell::new(&price).style_spec("Fy"),
+            Cell::new(&t.vcpus.to_string()),
+            Cell::new(&t.memory_gib.to_string()),
+            Cell::new(&t.storage_gib.to_string()),
+            availability_cell,
+        ]));
     }
 
     table.printstd();
@@ -217,6 +235,7 @@ fn start_instance(
     name: Option<&str>,
     region: Option<&str>,
     filesystem: Option<&str>,
+    image: Option<&str>,
     no_notify: bool,
 ) -> Result<()> {
     // Auto-enable notifications if env vars are configured (unless --no-notify)
@@ -236,16 +255,19 @@ fn start_instance(
     let fs_info = filesystem
         .map(|f| format!(" with filesystem '{}'", f.magenta()))
         .unwrap_or_default();
+    let image_family = resolve_image_family(image);
     println!(
-        "Launching {} {}{}...",
+        "Launching {} {}{} on image {}...",
         gpu.green(),
         name.map(|n| format!("as '{}'", n.cyan()))
             .unwrap_or_default(),
-        fs_info
+        fs_info,
+        image_family.magenta()
     );
 
-    let result =
-        rt.block_on(client.launch_instance_with_filesystem(gpu, ssh, name, region, filesystem))?;
+    let result = rt.block_on(
+        client.launch_instance_with_filesystem(gpu, ssh, name, region, filesystem, image),
+    )?;
 
     println!(
         "{} Instance {} launched in region {}",
@@ -367,31 +389,38 @@ fn list_running_instances(rt: &Runtime, client: &LambdaClient) -> Result<()> {
 
     for instance in instances {
         let status = instance.status.as_deref().unwrap_or("N/A");
-        let status_colored = match status {
-            "active" => status.green().to_string(),
-            "booting" => status.yellow().to_string(),
-            "unhealthy" | "terminated" => status.red().to_string(),
-            _ => status.to_string(),
+        let status_cell = match status {
+            "active" => Cell::new(status).style_spec("Fg"),
+            "booting" => Cell::new(status).style_spec("Fy"),
+            "unhealthy" | "terminated" => Cell::new(status).style_spec("Fr"),
+            _ => Cell::new(status),
         };
 
-        table.add_row(row![
-            instance.id.unwrap_or_else(|| "N/A".to_string()).cyan(),
-            instance.name.unwrap_or_else(|| "-".to_string()).white(),
-            instance
-                .instance_type
-                .and_then(|t| t.name)
-                .unwrap_or_else(|| "N/A".to_string()),
-            instance
-                .region
-                .and_then(|r| r.name)
-                .unwrap_or_else(|| "N/A".to_string()),
-            status_colored,
-            instance.ip.unwrap_or_else(|| "N/A".to_string()).blue(),
-            instance
-                .ssh_key_names
-                .map(|keys| keys.join(", "))
-                .unwrap_or_else(|| "N/A".to_string())
-        ]);
+        let id = instance.id.unwrap_or_else(|| "N/A".to_string());
+        let name = instance.name.unwrap_or_else(|| "-".to_string());
+        let instance_type = instance
+            .instance_type
+            .and_then(|t| t.name)
+            .unwrap_or_else(|| "N/A".to_string());
+        let region = instance
+            .region
+            .and_then(|r| r.name)
+            .unwrap_or_else(|| "N/A".to_string());
+        let ip = instance.ip.unwrap_or_else(|| "N/A".to_string());
+        let ssh_keys = instance
+            .ssh_key_names
+            .map(|keys| keys.join(", "))
+            .unwrap_or_else(|| "N/A".to_string());
+
+        table.add_row(Row::new(vec![
+            Cell::new(&id).style_spec("Fc"),
+            Cell::new(&name).style_spec("Fw"),
+            Cell::new(&instance_type),
+            Cell::new(&region),
+            status_cell,
+            Cell::new(&ip).style_spec("Fb"),
+            Cell::new(&ssh_keys),
+        ]));
     }
 
     table.printstd();
@@ -407,6 +436,7 @@ fn find_and_start_instance(
     interval: u64,
     name: Option<&str>,
     filesystem: Option<&str>,
+    image: Option<&str>,
     no_notify: bool,
 ) -> Result<()> {
     if ssh.is_empty() {
@@ -440,7 +470,9 @@ fn find_and_start_instance(
                     regions.join(", ").blue()
                 );
 
-                return start_instance(rt, client, gpu, ssh, name, None, filesystem, no_notify);
+                return start_instance(
+                    rt, client, gpu, ssh, name, None, filesystem, image, no_notify,
+                );
             }
             Ok(_) => {
                 // No availability
@@ -461,10 +493,50 @@ fn find_and_start_instance(
         execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0)).ok();
         let mut table = Table::new();
         table.add_row(row!["Instance Type", "Last Checked", "Status"]);
-        table.add_row(row![gpu.green(), check_time, "No availability".red()]);
+        table.add_row(Row::new(vec![
+            Cell::new(gpu).style_spec("Fg"),
+            Cell::new(&check_time),
+            Cell::new("No availability").style_spec("Fr"),
+        ]));
         table.printstd();
         println!("\nNext check in {} seconds... (Ctrl+C to stop)", interval);
     }
+}
+
+fn list_images(rt: &Runtime, client: &LambdaClient) -> Result<()> {
+    let images = rt.block_on(client.list_images())?;
+    let families = summarize_image_families(&images);
+
+    if families.is_empty() {
+        println!("{}", "No images available".yellow());
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.add_row(row![
+        "Image (--image)",
+        "Description",
+        "Architectures",
+        "# Regions"
+    ]);
+
+    for family in families {
+        let (family_text, family_spec) = if family.family == DEFAULT_IMAGE_FAMILY {
+            (format!("{} (default)", family.family), "Fg")
+        } else {
+            (family.family.clone(), "Fc")
+        };
+
+        table.add_row(Row::new(vec![
+            Cell::new(&family_text).style_spec(family_spec),
+            Cell::new(&family.description),
+            Cell::new(&family.architectures.join(", ")).style_spec("Fb"),
+            Cell::new(&family.regions.len().to_string()),
+        ]));
+    }
+
+    table.printstd();
+    Ok(())
 }
 
 fn list_filesystems(rt: &Runtime, client: &LambdaClient) -> Result<()> {
@@ -487,10 +559,10 @@ fn list_filesystems(rt: &Runtime, client: &LambdaClient) -> Result<()> {
     ]);
 
     for fs in filesystems {
-        let in_use = if fs.is_in_use {
-            "Yes".green().to_string()
+        let in_use_cell = if fs.is_in_use {
+            Cell::new("Yes").style_spec("Fg")
         } else {
-            "No".dimmed().to_string()
+            Cell::new("No")
         };
 
         let bytes_str = if fs.bytes_used > 1_000_000_000 {
@@ -503,15 +575,15 @@ fn list_filesystems(rt: &Runtime, client: &LambdaClient) -> Result<()> {
             format!("{} B", fs.bytes_used)
         };
 
-        table.add_row(row![
-            fs.id.cyan(),
-            fs.name.green(),
-            fs.region.name.blue(),
-            fs.mount_point,
-            in_use,
-            bytes_str,
-            fs.created
-        ]);
+        table.add_row(Row::new(vec![
+            Cell::new(&fs.id).style_spec("Fc"),
+            Cell::new(&fs.name).style_spec("Fg"),
+            Cell::new(&fs.region.name).style_spec("Fb"),
+            Cell::new(&fs.mount_point),
+            in_use_cell,
+            Cell::new(&bytes_str),
+            Cell::new(&fs.created),
+        ]));
     }
 
     table.printstd();
